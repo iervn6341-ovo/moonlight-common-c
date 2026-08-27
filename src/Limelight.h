@@ -483,6 +483,12 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// This callback is invoked when the host's clipboard contents have changed.
+// The client will probably want to mirror this into the local OS clipboard.
+// utf8Text is not NULL-terminated; use the provided length. This is a
+// Sunshine protocol extension and will never be invoked for GFE hosts.
+typedef void(*ConnListenerClipboardUpdated)(const char* utf8Text, int length);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -497,6 +503,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerClipboardUpdated clipboardUpdated;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -710,6 +717,12 @@ int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char fla
 
 // This function queues an UTF-8 encoded text to be sent to the remote server.
 int LiSendUtf8TextEvent(const char *text, unsigned int length);
+
+// This function sends the client's local clipboard contents to the host so it
+// can mirror them into its own OS clipboard. utf8Text does not need to be
+// NULL-terminated. This is a Sunshine protocol extension and this call is a
+// no-op (returns a negative error code) when connected to a GFE host.
+int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length);
 
 // Button flags
 #define A_FLAG     0x1000

@@ -83,6 +83,12 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint8_t left[DS_EFFECT_PAYLOAD_SIZE];
             uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
         } dsAdaptiveTrigger;
+        struct {
+            // Heap-allocated reassembled clipboard text. Ownership transfers
+            // to the async callback dispatcher, which must free() it.
+            char* text;
+            int length;
+        } clipboard;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -105,6 +111,15 @@ static bool disconnectPending;
 static bool encryptedControlStream;
 static bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
+
+// Reassembly state for chunked IDX_SET_CLIPBOARD messages received from the host.
+// Clipboard text can exceed the size of a single control message, so it is split
+// into sequential chunks by the sender and reassembled here as they arrive in order
+// on the reliable control channel.
+#define MAX_CLIPBOARD_TEXT_SIZE (1024 * 1024)
+static char* clipboardReassemblyBuffer;
+static uint32_t clipboardReassemblyTotalLength;
+static uint32_t clipboardReassemblyReceivedLength;
 
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
@@ -140,6 +155,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_MOTION_EVENT 10
 #define IDX_SET_RGB_LED 11
 #define IDX_DS_ADAPTIVE_TRIGGERS 12
+#define IDX_SET_CLIPBOARD 13
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -157,6 +173,8 @@ static const short packetTypesGen3[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -171,6 +189,8 @@ static const short packetTypesGen4[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -185,6 +205,8 @@ static const short packetTypesGen5[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -199,6 +221,8 @@ static const short packetTypesGen7[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -214,6 +238,7 @@ static const short packetTypesGen7Enc[] = {
     0x5501, // Set motion event (Sunshine protocol extension)
     0x5502, // Set RGB LED (Sunshine protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
+    0x5504, // Clipboard (Sunshine protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -357,6 +382,10 @@ int initializeControlStream(void) {
     hdrEnabled = false;
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
 
+    free(clipboardReassemblyBuffer);
+    clipboardReassemblyBuffer = NULL;
+    clipboardReassemblyTotalLength = clipboardReassemblyReceivedLength = 0;
+
     return 0;
 }
 
@@ -370,6 +399,24 @@ static void freeBasicLbqList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
     }
 }
 
+// Frees any queued async callback entries, including the heap-allocated
+// clipboard text owned by any still-queued IDX_SET_CLIPBOARD entries.
+static void freeAsyncCallbackList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+    PLINKED_BLOCKING_QUEUE_ENTRY nextEntry;
+
+    while (entry != NULL) {
+        nextEntry = entry->flink;
+
+        PQUEUED_ASYNC_CALLBACK queuedCb = (PQUEUED_ASYNC_CALLBACK)entry->data;
+        if (queuedCb->typeIndex == IDX_SET_CLIPBOARD) {
+            free(queuedCb->data.clipboard.text);
+        }
+        free(queuedCb);
+
+        entry = nextEntry;
+    }
+}
+
 // Cleans up control stream
 void destroyControlStream(void) {
     LC_ASSERT(stopping);
@@ -378,7 +425,10 @@ void destroyControlStream(void) {
     PltCloseEvent(&idrFrameRequiredEvent);
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&referenceFrameControlQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
-    freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
+    freeAsyncCallbackList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
+
+    free(clipboardReassemblyBuffer);
+    clipboardReassemblyBuffer = NULL;
 
     PltDeleteMutex(&enetMutex);
 }
@@ -1010,6 +1060,12 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_SET_CLIPBOARD:
+            // Fully reassembled text is attached directly to this entry (not batched,
+            // since these are already coalesced into a single message per clipboard change).
+            ListenerCallbacks.clipboardUpdated(queuedCb->data.clipboard.text, queuedCb->data.clipboard.length);
+            free(queuedCb->data.clipboard.text);
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1017,6 +1073,71 @@ static void asyncCallbackThreadFunc(void* context) {
         }
 
         free(queuedCb);
+    }
+}
+
+// Called for each received IDX_SET_CLIPBOARD chunk. Reassembles the chunks in
+// clipboardReassemblyBuffer and queues a single async callback once the last
+// chunk (chunkOffset + chunkLength == totalLength) has been received.
+static void handleClipboardChunk(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    BYTE_BUFFER bb;
+    uint32_t totalLength;
+    uint16_t chunkLength;
+
+    BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+    BbGet32(&bb, &totalLength);
+    BbGet16(&bb, &chunkLength);
+
+    if (totalLength > MAX_CLIPBOARD_TEXT_SIZE || chunkLength > totalLength) {
+        Limelog("Clipboard update exceeds maximum supported size (%u bytes); dropping\n", totalLength);
+        free(clipboardReassemblyBuffer);
+        clipboardReassemblyBuffer = NULL;
+        clipboardReassemblyTotalLength = clipboardReassemblyReceivedLength = 0;
+        return;
+    }
+
+    // Start a new reassembly on the first chunk of a message. We infer this by comparing
+    // against our currently tracked total length rather than a separate first-chunk flag,
+    // so a change in totalLength always starts a fresh reassembly (also handles a prior
+    // message being interrupted by a new one).
+    if (clipboardReassemblyBuffer == NULL || clipboardReassemblyTotalLength != totalLength) {
+        free(clipboardReassemblyBuffer);
+        clipboardReassemblyReceivedLength = 0;
+        clipboardReassemblyTotalLength = totalLength;
+
+        // Handle an empty clipboard (nothing to reassemble) directly below
+        clipboardReassemblyBuffer = totalLength != 0 ? malloc(totalLength) : NULL;
+        if (totalLength != 0 && clipboardReassemblyBuffer == NULL) {
+            clipboardReassemblyTotalLength = 0;
+            return;
+        }
+    }
+
+    if (chunkLength != 0 && clipboardReassemblyReceivedLength + chunkLength <= clipboardReassemblyTotalLength) {
+        BbGetBytes(&bb, (uint8_t*)(clipboardReassemblyBuffer + clipboardReassemblyReceivedLength), chunkLength);
+        clipboardReassemblyReceivedLength += chunkLength;
+    }
+
+    if (clipboardReassemblyReceivedLength == clipboardReassemblyTotalLength) {
+        PQUEUED_ASYNC_CALLBACK queuedCb = malloc(sizeof(*queuedCb));
+        if (queuedCb != NULL) {
+            queuedCb->typeIndex = IDX_SET_CLIPBOARD;
+            queuedCb->data.clipboard.text = clipboardReassemblyBuffer;
+            queuedCb->data.clipboard.length = (int)clipboardReassemblyTotalLength;
+
+            if (LbqOfferQueueItem(&asyncCallbackQueue, queuedCb, &queuedCb->entry) != LBQ_SUCCESS) {
+                Limelog("Failed to queue clipboard callback\n");
+                free(clipboardReassemblyBuffer);
+                free(queuedCb);
+            }
+        }
+        else {
+            free(clipboardReassemblyBuffer);
+        }
+
+        // Ownership of clipboardReassemblyBuffer has transferred to the queued callback (or it was freed above)
+        clipboardReassemblyBuffer = NULL;
+        clipboardReassemblyTotalLength = clipboardReassemblyReceivedLength = 0;
     }
 }
 
@@ -1290,6 +1411,14 @@ static void controlReceiveThreadFunc(void* context) {
                 }
 
                 hdrEnabled = (enableByte != 0);
+            }
+
+            // Clipboard text may be split into several chunks by the sender since it can
+            // exceed the size of a single control message. Reassemble them here and only
+            // notify the client once the final chunk has arrived. This relies on the
+            // reliable, ordered delivery of the control channel to reassemble correctly.
+            if (ctlHdr->type == packetTypes[IDX_SET_CLIPBOARD]) {
+                handleClipboardChunk(ctlHdr, packetLength);
             }
 
             // Process client callbacks in a separate thread
@@ -2083,4 +2212,48 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
 
     *metadata = hdrMetadata;
     return true;
+}
+
+// Kept small to stay well under sendMessageEnet()'s internal encryption scratch
+// buffer size, so a single chunk always fits in one control message.
+#define CLIPBOARD_CHUNK_PAYLOAD_SIZE 200
+
+int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length) {
+    uint32_t offset;
+
+    if (!IS_SUNSHINE()) {
+        // Clipboard sync is a Sunshine protocol extension
+        return -1;
+    }
+
+    if (length > MAX_CLIPBOARD_TEXT_SIZE) {
+        return -1;
+    }
+
+    offset = 0;
+    do {
+        uint16_t chunkLength = (uint16_t)MIN(length - offset, CLIPBOARD_CHUNK_PAYLOAD_SIZE);
+        char buffer[sizeof(uint32_t) + sizeof(uint16_t) + CLIPBOARD_CHUNK_PAYLOAD_SIZE];
+        uint32_t totalLengthLE = LE32(length);
+        uint16_t chunkLengthLE = LE16(chunkLength);
+
+        memcpy(buffer, &totalLengthLE, sizeof(totalLengthLE));
+        memcpy(buffer + sizeof(totalLengthLE), &chunkLengthLE, sizeof(chunkLengthLE));
+        if (chunkLength != 0) {
+            memcpy(buffer + sizeof(totalLengthLE) + sizeof(chunkLengthLE), utf8Text + offset, chunkLength);
+        }
+
+        offset += chunkLength;
+
+        if (!sendMessageAndForget(packetTypes[IDX_SET_CLIPBOARD],
+                                  (short)(sizeof(totalLengthLE) + sizeof(chunkLengthLE) + chunkLength),
+                                  buffer,
+                                  CTRL_CHANNEL_GENERIC,
+                                  ENET_PACKET_FLAG_RELIABLE,
+                                  offset < length)) {
+            return -1;
+        }
+    } while (offset < length);
+
+    return 0;
 }
