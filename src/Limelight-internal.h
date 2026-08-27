@@ -61,6 +61,7 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define CTRL_CHANNEL_PEN          0x04
 #define CTRL_CHANNEL_TOUCH        0x05
 #define CTRL_CHANNEL_UTF8         0x06
+#define CTRL_CHANNEL_FILE_TRANSFER 0x07
 #define CTRL_CHANNEL_GAMEPAD_BASE 0x10 // 0x10 to 0x1F by controller index
 #define CTRL_CHANNEL_SENSOR_BASE  0x20 // 0x20 to 0x2F by controller index
 #define CTRL_CHANNEL_COUNT        0x30
@@ -87,6 +88,7 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+#define ML_FF_FILE_TRANSFER 0x04 // Client supports the bidirectional file transfer extension
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 

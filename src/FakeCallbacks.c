@@ -42,6 +42,7 @@ static void fakeClSetMotionEventState(uint16_t controllerNumber, uint8_t motionT
 static void fakeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {};
 static void fakeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b) {}
 static void fakeClClipboardUpdated(const char* utf8Text, int length) {}
+static void fakeClFileTransferEvent(const LI_FILE_TRANSFER_EVENT* event) {}
 
 static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .stageStarting = fakeClStageStarting,
@@ -58,6 +59,7 @@ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .setControllerLED = fakeClSetControllerLED,
     .setAdaptiveTriggers = fakeClSetAdaptiveTriggers,
     .clipboardUpdated = fakeClClipboardUpdated,
+    .fileTransferEvent = fakeClFileTransferEvent,
 };
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
@@ -150,6 +152,9 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
         }
         if ((*clCallbacks)->clipboardUpdated == NULL) {
             (*clCallbacks)->clipboardUpdated = fakeClClipboardUpdated;
+        }
+        if ((*clCallbacks)->fileTransferEvent == NULL) {
+            (*clCallbacks)->fileTransferEvent = fakeClFileTransferEvent;
         }
     }
 }

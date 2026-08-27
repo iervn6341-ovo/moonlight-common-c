@@ -489,6 +489,38 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 // Sunshine protocol extension and will never be invoked for GFE hosts.
 typedef void(*ConnListenerClipboardUpdated)(const char* utf8Text, int length);
 
+// File transfer events are delivered synchronously from the control receive
+// thread. Pointers in this structure are valid only for the duration of the
+// callback and must be copied before returning.
+#define LI_FTE_DOWNLOAD_REQUEST 1
+#define LI_FTE_OFFER            2
+#define LI_FTE_DATA             3
+#define LI_FTE_COMPLETE         4
+#define LI_FTE_CANCEL           5
+
+#define LI_FT_CANCEL_USER       1
+#define LI_FT_CANCEL_IO_ERROR   2
+#define LI_FT_CANCEL_PROTOCOL   3
+#define LI_FT_CANCEL_TOO_LARGE  4
+
+#define LI_FILE_TRANSFER_CHUNK_SIZE (12 * 1024)
+#define LI_MAX_FILE_TRANSFER_SIZE (UINT64_C(16) * 1024 * 1024 * 1024)
+
+typedef struct _LI_FILE_TRANSFER_EVENT {
+    uint8_t eventType;
+    uint16_t status;
+    uint32_t transferId;
+    uint64_t totalSize;
+    uint64_t offset;
+    const char* fileName;
+    uint16_t fileNameLength;
+    const unsigned char* data;
+    uint16_t dataLength;
+    const unsigned char* sha256;
+} LI_FILE_TRANSFER_EVENT, *PLI_FILE_TRANSFER_EVENT;
+
+typedef void(*ConnListenerFileTransferEvent)(const LI_FILE_TRANSFER_EVENT* event);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -504,6 +536,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
     ConnListenerClipboardUpdated clipboardUpdated;
+    ConnListenerFileTransferEvent fileTransferEvent;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -723,6 +756,15 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length);
 // NULL-terminated. This is a Sunshine protocol extension and this call is a
 // no-op (returns a negative error code) when connected to a GFE host.
 int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length);
+
+// Bidirectional file transfer extension for compatible Sunshine hosts. A
+// download request asks the host to present its file picker. Offer/data/complete
+// messages stream a selected file, while cancel terminates the specified transfer.
+int LiRequestFileDownload(void);
+int LiSendFileTransferOffer(uint32_t transferId, const char* fileName, uint16_t fileNameLength, uint64_t totalSize);
+int LiSendFileTransferData(uint32_t transferId, uint64_t offset, const unsigned char* data, uint16_t dataLength);
+int LiSendFileTransferComplete(uint32_t transferId, const unsigned char sha256[32]);
+int LiCancelFileTransfer(uint32_t transferId, uint16_t reason);
 
 // Button flags
 #define A_FLAG     0x1000
@@ -1023,6 +1065,7 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_FILE_TRANSFER          0x04 // Bidirectional file transfer supported
 #define LI_FF_CLIPBOARD              0x08 // Bidirectional clipboard supported
 uint32_t LiGetHostFeatureFlags(void);
 

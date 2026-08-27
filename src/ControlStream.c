@@ -156,6 +156,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_RGB_LED 11
 #define IDX_DS_ADAPTIVE_TRIGGERS 12
 #define IDX_SET_CLIPBOARD 13
+#define IDX_FILE_TRANSFER 14
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -175,6 +176,7 @@ static const short packetTypesGen3[] = {
     -1,     // Set RGB LED (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard (unused)
+    -1,     // File transfer (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -191,6 +193,7 @@ static const short packetTypesGen4[] = {
     -1,     // Set RGB LED (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard (unused)
+    -1,     // File transfer (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -207,6 +210,7 @@ static const short packetTypesGen5[] = {
     -1,     // Set RGB LED (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard (unused)
+    -1,     // File transfer (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -223,6 +227,7 @@ static const short packetTypesGen7[] = {
     -1,     // Set RGB LED (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard (unused)
+    -1,     // File transfer (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -239,6 +244,7 @@ static const short packetTypesGen7Enc[] = {
     0x5502, // Set RGB LED (Sunshine protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
     0x5504, // Clipboard (Sunshine protocol extension)
+    0x5505, // File transfer (Sunshine protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -753,7 +759,10 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     if (encryptedControlStream) {
         PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
         PNVCTL_ENET_PACKET_HEADER_V2 packet;
-        char tempBuffer[256];
+        // File transfer packets are intentionally larger than ordinary control
+        // messages to avoid excessive per-packet overhead. Keep this bounded
+        // below INT16_MAX because payloadLength is a signed short in this API.
+        char tempBuffer[16 * 1024];
 
         enetPacket = enet_packet_create(NULL,
                                         sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
@@ -1142,6 +1151,80 @@ static void handleClipboardChunk(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packet
     }
 }
 
+static void handleFileTransferEvent(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    BYTE_BUFFER bb;
+    LI_FILE_TRANSFER_EVENT event = {0};
+    uint16_t variableLength;
+
+    if (packetLength <= (int)sizeof(*ctlHdr)) {
+        return;
+    }
+
+    BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+    if (!BbGet8(&bb, &event.eventType)) {
+        return;
+    }
+
+    switch (event.eventType) {
+    case LI_FTE_DOWNLOAD_REQUEST:
+        if (bb.position != bb.length) {
+            Limelog("Discarding malformed file transfer download request\n");
+            return;
+        }
+        break;
+
+    case LI_FTE_OFFER:
+        if (!BbGet32(&bb, &event.transferId) ||
+                !BbGet64(&bb, &event.totalSize) ||
+                !BbGet16(&bb, &variableLength) ||
+                variableLength == 0 || variableLength > 255 ||
+                event.totalSize > LI_MAX_FILE_TRANSFER_SIZE ||
+                bb.position + variableLength != bb.length) {
+            Limelog("Discarding malformed file transfer offer\n");
+            return;
+        }
+        event.fileNameLength = variableLength;
+        event.fileName = &bb.buffer[bb.position];
+        break;
+
+    case LI_FTE_DATA:
+        if (!BbGet32(&bb, &event.transferId) ||
+                !BbGet64(&bb, &event.offset) ||
+                !BbGet16(&bb, &variableLength) ||
+                variableLength == 0 || variableLength > LI_FILE_TRANSFER_CHUNK_SIZE ||
+                bb.position + variableLength != bb.length) {
+            Limelog("Discarding malformed file transfer data\n");
+            return;
+        }
+        event.dataLength = variableLength;
+        event.data = (const unsigned char*)&bb.buffer[bb.position];
+        break;
+
+    case LI_FTE_COMPLETE:
+        if (!BbGet32(&bb, &event.transferId) || bb.position + 32 != bb.length) {
+            Limelog("Discarding malformed file transfer completion\n");
+            return;
+        }
+        event.sha256 = (const unsigned char*)&bb.buffer[bb.position];
+        break;
+
+    case LI_FTE_CANCEL:
+        if (!BbGet32(&bb, &event.transferId) ||
+                !BbGet16(&bb, &event.status) ||
+                bb.position != bb.length) {
+            Limelog("Discarding malformed file transfer cancellation\n");
+            return;
+        }
+        break;
+
+    default:
+        Limelog("Discarding unknown file transfer event: %u\n", event.eventType);
+        return;
+    }
+
+    ListenerCallbacks.fileTransferEvent(&event);
+}
+
 static bool needsAsyncCallback(unsigned short packetType) {
     return packetType == packetTypes[IDX_RUMBLE_DATA] ||
            packetType == packetTypes[IDX_RUMBLE_TRIGGER_DATA] ||
@@ -1420,6 +1503,10 @@ static void controlReceiveThreadFunc(void* context) {
             // reliable, ordered delivery of the control channel to reassemble correctly.
             if (ctlHdr->type == packetTypes[IDX_SET_CLIPBOARD]) {
                 handleClipboardChunk(ctlHdr, packetLength);
+            }
+
+            if (ctlHdr->type == packetTypes[IDX_FILE_TRANSFER]) {
+                handleFileTransferEvent(ctlHdr, packetLength);
             }
 
             // Process client callbacks in a separate thread
@@ -2264,4 +2351,97 @@ int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length) {
     Limelog("Clipboard protocol TX complete: bytes=%u chunks=%u\n", length, chunkCount);
 
     return 0;
+}
+
+static int sendFileTransferPayload(const char* payload, short payloadLength, bool moreData) {
+    if (!IS_SUNSHINE() ||
+            !(SunshineFeatureFlags & LI_FF_FILE_TRANSFER) ||
+            packetTypes[IDX_FILE_TRANSFER] < 0) {
+        return -1;
+    }
+
+    return sendMessageAndForget(packetTypes[IDX_FILE_TRANSFER],
+                                payloadLength,
+                                payload,
+                                CTRL_CHANNEL_FILE_TRANSFER,
+                                ENET_PACKET_FLAG_RELIABLE,
+                                moreData) ? 0 : -1;
+}
+
+int LiRequestFileDownload(void) {
+    const char payload[] = { LI_FTE_DOWNLOAD_REQUEST };
+    return sendFileTransferPayload(payload, sizeof(payload), false);
+}
+
+int LiSendFileTransferOffer(uint32_t transferId, const char* fileName, uint16_t fileNameLength, uint64_t totalSize) {
+    char payload[1 + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t) + 255];
+    BYTE_BUFFER bb;
+
+    if (transferId == 0 || fileName == NULL || fileNameLength == 0 ||
+            fileNameLength > 255 || totalSize > LI_MAX_FILE_TRANSFER_SIZE) {
+        return -1;
+    }
+
+    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
+    if (!BbPut8(&bb, LI_FTE_OFFER) ||
+            !BbPut32(&bb, transferId) ||
+            !BbPut64(&bb, totalSize) ||
+            !BbPut16(&bb, fileNameLength) ||
+            !BbPutBytes(&bb, (const uint8_t*)fileName, fileNameLength)) {
+        return -1;
+    }
+
+    return sendFileTransferPayload(payload, (short)bb.position, false);
+}
+
+int LiSendFileTransferData(uint32_t transferId, uint64_t offset, const unsigned char* data, uint16_t dataLength) {
+    char payload[1 + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t) + LI_FILE_TRANSFER_CHUNK_SIZE];
+    BYTE_BUFFER bb;
+
+    if (transferId == 0 || data == NULL || dataLength == 0 || dataLength > LI_FILE_TRANSFER_CHUNK_SIZE) {
+        return -1;
+    }
+
+    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
+    if (!BbPut8(&bb, LI_FTE_DATA) ||
+            !BbPut32(&bb, transferId) ||
+            !BbPut64(&bb, offset) ||
+            !BbPut16(&bb, dataLength) ||
+            !BbPutBytes(&bb, data, dataLength)) {
+        return -1;
+    }
+
+    return sendFileTransferPayload(payload, (short)bb.position, false);
+}
+
+int LiSendFileTransferComplete(uint32_t transferId, const unsigned char sha256[32]) {
+    char payload[1 + sizeof(uint32_t) + 32];
+    BYTE_BUFFER bb;
+
+    if (transferId == 0 || sha256 == NULL) {
+        return -1;
+    }
+
+    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
+    if (!BbPut8(&bb, LI_FTE_COMPLETE) ||
+            !BbPut32(&bb, transferId) ||
+            !BbPutBytes(&bb, sha256, 32)) {
+        return -1;
+    }
+
+    return sendFileTransferPayload(payload, (short)bb.position, false);
+}
+
+int LiCancelFileTransfer(uint32_t transferId, uint16_t reason) {
+    char payload[1 + sizeof(uint32_t) + sizeof(uint16_t)];
+    BYTE_BUFFER bb;
+
+    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
+    if (!BbPut8(&bb, LI_FTE_CANCEL) ||
+            !BbPut32(&bb, transferId) ||
+            !BbPut16(&bb, reason)) {
+        return -1;
+    }
+
+    return sendFileTransferPayload(payload, (short)bb.position, false);
 }
