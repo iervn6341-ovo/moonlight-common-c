@@ -1145,6 +1145,10 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", &SunshineFeatureFlags)) {
             SunshineFeatureFlags = 0;
         }
+        Limelog("Negotiated x-ss-general.featureFlags=0x%02x (%u); clipboard=%s\n",
+                SunshineFeatureFlags,
+                SunshineFeatureFlags,
+                (SunshineFeatureFlags & LI_FF_CLIPBOARD) ? "yes" : "no");
 
         // Look for the Sunshine encryption flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {

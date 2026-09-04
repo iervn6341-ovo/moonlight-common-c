@@ -1119,6 +1119,7 @@ static void handleClipboardChunk(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packet
     }
 
     if (clipboardReassemblyReceivedLength == clipboardReassemblyTotalLength) {
+        Limelog("Clipboard protocol RX reassembled: bytes=%u\n", clipboardReassemblyTotalLength);
         PQUEUED_ASYNC_CALLBACK queuedCb = malloc(sizeof(*queuedCb));
         if (queuedCb != NULL) {
             queuedCb->typeIndex = IDX_SET_CLIPBOARD;
@@ -2220,13 +2221,17 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
 
 int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length) {
     uint32_t offset;
+    uint32_t chunkCount = 0;
 
-    if (!IS_SUNSHINE()) {
+    if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_CLIPBOARD)) {
         // Clipboard sync is a Sunshine protocol extension
+        Limelog("Clipboard TX rejected: hostFlags=0x%02x requires 0x08\n", SunshineFeatureFlags);
         return -1;
     }
 
     if (length > MAX_CLIPBOARD_TEXT_SIZE) {
+        Limelog("Clipboard TX rejected: bytes=%u exceeds maximum=%u\n",
+                length, (unsigned int)MAX_CLIPBOARD_TEXT_SIZE);
         return -1;
     }
 
@@ -2244,6 +2249,7 @@ int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length) {
         }
 
         offset += chunkLength;
+        chunkCount++;
 
         if (!sendMessageAndForget(packetTypes[IDX_SET_CLIPBOARD],
                                   (short)(sizeof(totalLengthLE) + sizeof(chunkLengthLE) + chunkLength),
@@ -2254,6 +2260,8 @@ int LiSendClipboardTextEvent(const char *utf8Text, unsigned int length) {
             return -1;
         }
     } while (offset < length);
+
+    Limelog("Clipboard protocol TX complete: bytes=%u chunks=%u\n", length, chunkCount);
 
     return 0;
 }
