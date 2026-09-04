@@ -497,13 +497,17 @@ typedef void(*ConnListenerClipboardUpdated)(const char* utf8Text, int length);
 #define LI_FTE_DATA             3
 #define LI_FTE_COMPLETE         4
 #define LI_FTE_CANCEL           5
+#define LI_FTE_ACK              6
 
 #define LI_FT_CANCEL_USER       1
 #define LI_FT_CANCEL_IO_ERROR   2
 #define LI_FT_CANCEL_PROTOCOL   3
 #define LI_FT_CANCEL_TOO_LARGE  4
+#define LI_FT_CANCEL_UNSUPPORTED 5
+#define LI_FT_CANCEL_BUSY       6
 
 #define LI_FILE_TRANSFER_CHUNK_SIZE (12 * 1024)
+#define LI_FILE_TRANSFER_BATCH_CHUNKS 8
 #define LI_MAX_FILE_TRANSFER_SIZE (UINT64_C(16) * 1024 * 1024 * 1024)
 
 typedef struct _LI_FILE_TRANSFER_EVENT {
@@ -608,6 +612,13 @@ const char* LiGetStageName(int stage);
 // ENet for the control stream (very old versions), or if the ENet peer is not connected.
 // This function may only be called between LiStartConnection() and LiStopConnection().
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
+
+// This function returns the current reliable control-channel packet loss as a
+// normalized value from 0.0 to 1.0. It has the same lifetime and ENet version
+// requirements as LiGetEstimatedRttInfo().
+//
+// This function may only be called between LiStartConnection() and LiStopConnection().
+bool LiGetEstimatedPacketLoss(float* estimatedPacketLoss);
 
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
@@ -765,6 +776,7 @@ int LiSendFileTransferOffer(uint32_t transferId, const char* fileName, uint16_t 
 int LiSendFileTransferData(uint32_t transferId, uint64_t offset, const unsigned char* data, uint16_t dataLength);
 int LiSendFileTransferComplete(uint32_t transferId, const unsigned char sha256[32]);
 int LiCancelFileTransfer(uint32_t transferId, uint16_t reason);
+int LiAcknowledgeFileTransfer(uint32_t transferId);
 
 // Button flags
 #define A_FLAG     0x1000

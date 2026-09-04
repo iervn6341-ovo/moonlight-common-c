@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "FileTransferProtocol.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -1178,7 +1179,6 @@ static void handleFileTransferEvent(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int pac
                 !BbGet64(&bb, &event.totalSize) ||
                 !BbGet16(&bb, &variableLength) ||
                 variableLength == 0 || variableLength > 255 ||
-                event.totalSize > LI_MAX_FILE_TRANSFER_SIZE ||
                 bb.position + variableLength != bb.length) {
             Limelog("Discarding malformed file transfer offer\n");
             return;
@@ -1209,10 +1209,15 @@ static void handleFileTransferEvent(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int pac
         break;
 
     case LI_FTE_CANCEL:
-        if (!BbGet32(&bb, &event.transferId) ||
-                !BbGet16(&bb, &event.status) ||
-                bb.position != bb.length) {
+        if (!LiParseFileTransferStatusPayload(&bb, &event)) {
             Limelog("Discarding malformed file transfer cancellation\n");
+            return;
+        }
+        break;
+
+    case LI_FTE_ACK:
+        if (!LiParseFileTransferStatusPayload(&bb, &event)) {
+            Limelog("Discarding malformed file transfer acknowledgement\n");
             return;
         }
         break;
@@ -1220,6 +1225,31 @@ static void handleFileTransferEvent(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int pac
     default:
         Limelog("Discarding unknown file transfer event: %u\n", event.eventType);
         return;
+    }
+
+    switch (event.eventType) {
+    case LI_FTE_OFFER:
+        Limelog("File transfer RX OFFER id=%u size=%llu nameBytes=%u\n",
+                event.transferId, (unsigned long long)event.totalSize, event.fileNameLength);
+        break;
+    case LI_FTE_DATA:
+        if (event.offset == 0 || (event.offset % (1024 * 1024)) < event.dataLength) {
+            Limelog("File transfer RX DATA id=%u offset=%llu bytes=%u\n",
+                    event.transferId, (unsigned long long)event.offset, event.dataLength);
+        }
+        break;
+    case LI_FTE_COMPLETE:
+        Limelog("File transfer RX COMPLETE id=%u sha256Bytes=32\n", event.transferId);
+        break;
+    case LI_FTE_CANCEL:
+        Limelog("File transfer RX CANCEL id=%u status=%u\n", event.transferId, event.status);
+        break;
+    case LI_FTE_ACK:
+        Limelog("File transfer RX ACK id=%u status=%u\n", event.transferId, event.status);
+        break;
+    case LI_FTE_DOWNLOAD_REQUEST:
+        Limelog("File transfer RX REQUEST\n");
+        break;
     }
 
     ListenerCallbacks.fileTransferEvent(&event);
@@ -1963,6 +1993,22 @@ bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVarianc
     return ret;
 }
 
+bool LiGetEstimatedPacketLoss(float* estimatedPacketLoss) {
+    bool ret = false;
+
+    // As with LiGetEstimatedRttInfo(), a slightly stale or torn diagnostic
+    // sample is preferable to blocking time-sensitive control traffic.
+    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
+        if (estimatedPacketLoss != NULL) {
+            *estimatedPacketLoss = peer->packetLoss / (float)ENET_PEER_PACKET_LOSS_SCALE;
+        }
+
+        ret = true;
+    }
+
+    return ret;
+}
+
 // Starts the control stream
 int startControlStream(void) {
     int err;
@@ -2370,6 +2416,9 @@ static int sendFileTransferPayload(const char* payload, short payloadLength, boo
 
 int LiRequestFileDownload(void) {
     const char payload[] = { LI_FTE_DOWNLOAD_REQUEST };
+    Limelog("File transfer TX REQUEST hostFlags=0x%02x packetType=0x%04x\n",
+            SunshineFeatureFlags,
+            packetTypes[IDX_FILE_TRANSFER]);
     return sendFileTransferPayload(payload, sizeof(payload), false);
 }
 
@@ -2391,6 +2440,9 @@ int LiSendFileTransferOffer(uint32_t transferId, const char* fileName, uint16_t 
         return -1;
     }
 
+    Limelog("File transfer TX OFFER id=%u size=%llu nameBytes=%u\n",
+            transferId, (unsigned long long)totalSize, fileNameLength);
+
     return sendFileTransferPayload(payload, (short)bb.position, false);
 }
 
@@ -2411,7 +2463,19 @@ int LiSendFileTransferData(uint32_t transferId, uint64_t offset, const unsigned 
         return -1;
     }
 
-    return sendFileTransferPayload(payload, (short)bb.position, false);
+    if (offset == 0 || (offset % (1024 * 1024)) < dataLength) {
+        Limelog("File transfer TX DATA id=%u offset=%llu bytes=%u\n",
+                transferId, (unsigned long long)offset, dataLength);
+    }
+
+    // Batch a bounded number of full DATA chunks before flushing ENet. This
+    // prevents thousands of 12 KiB writes from each taking the shared control
+    // mutex and waiting synchronously for transmission. A partial final chunk
+    // and COMPLETE always flush immediately.
+    const uint64_t nextChunkIndex = (offset / LI_FILE_TRANSFER_CHUNK_SIZE) + 1;
+    const bool moreData = dataLength == LI_FILE_TRANSFER_CHUNK_SIZE &&
+            (nextChunkIndex % LI_FILE_TRANSFER_BATCH_CHUNKS) != 0;
+    return sendFileTransferPayload(payload, (short)bb.position, moreData);
 }
 
 int LiSendFileTransferComplete(uint32_t transferId, const unsigned char sha256[32]) {
@@ -2429,19 +2493,43 @@ int LiSendFileTransferComplete(uint32_t transferId, const unsigned char sha256[3
         return -1;
     }
 
+    Limelog("File transfer TX COMPLETE id=%u sha256Bytes=32\n", transferId);
+
     return sendFileTransferPayload(payload, (short)bb.position, false);
 }
 
 int LiCancelFileTransfer(uint32_t transferId, uint16_t reason) {
-    char payload[1 + sizeof(uint32_t) + sizeof(uint16_t)];
-    BYTE_BUFFER bb;
+    char payload[LI_FILE_TRANSFER_STATUS_PAYLOAD_SIZE];
 
-    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
-    if (!BbPut8(&bb, LI_FTE_CANCEL) ||
-            !BbPut32(&bb, transferId) ||
-            !BbPut16(&bb, reason)) {
+    if (!LiSerializeFileTransferStatusPayload(payload,
+                                              sizeof(payload),
+                                              LI_FTE_CANCEL,
+                                              transferId,
+                                              reason)) {
         return -1;
     }
 
-    return sendFileTransferPayload(payload, (short)bb.position, false);
+    Limelog("File transfer TX CANCEL id=%u status=%u\n", transferId, reason);
+
+    return sendFileTransferPayload(payload, sizeof(payload), false);
+}
+
+int LiAcknowledgeFileTransfer(uint32_t transferId) {
+    char payload[LI_FILE_TRANSFER_STATUS_PAYLOAD_SIZE];
+
+    if (transferId == 0) {
+        return -1;
+    }
+
+    if (!LiSerializeFileTransferStatusPayload(payload,
+                                              sizeof(payload),
+                                              LI_FTE_ACK,
+                                              transferId,
+                                              0)) {
+        return -1;
+    }
+
+    Limelog("File transfer TX ACK id=%u status=0\n", transferId);
+
+    return sendFileTransferPayload(payload, sizeof(payload), false);
 }
